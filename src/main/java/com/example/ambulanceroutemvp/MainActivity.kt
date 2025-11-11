@@ -1,15 +1,13 @@
 package com.example.ambulanceroutemvp
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationResult
+
 import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
-import android.location.Location
-import androidx.activity.compose.rememberLauncherForActivityResult
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -23,23 +21,31 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
+import com.opencsv.CSVReader
+import org.json.JSONObject
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.io.InputStreamReader
 import kotlin.math.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
-data class Hospital(val name: String, val lat: Double, val lon: Double)
+data class Hospital(
+    val name: String,
+    val lat: Double,
+    val lon: Double
+)
+
 
 class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // initialize location client
         val fused = LocationServices.getFusedLocationProviderClient(this)
 
         setContent {
@@ -52,54 +58,42 @@ class MainActivity : ComponentActivity() {
                     context.getSharedPreferences("osmdroid", MODE_PRIVATE)
                 )
 
+                // Load hospitals from CSV
+                val hospitals by remember { mutableStateOf(loadHospitalsFromCsv(context)) }
                 var myLocation by remember { mutableStateOf<GeoPoint?>(null) }
                 var nearest by remember { mutableStateOf<Hospital?>(null) }
 
-                val hospitals = remember {
-                    listOf(
-                        Hospital("SCI International Hospital", 28.55032, 77.2341),
-                        Hospital("Netrayatan Hospita", 28.5302, 77.2454),
-                        Hospital("Apollo Spectra Hospitals", 28.5460, 77.2480),
-                        Hospital("Fortis C-Doc Hospital", 28.5474, 77.2496)
-                    )
-                }
-
-                val permissionLauncher =
-                    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-                        if (granted) {
-                            @SuppressLint("MissingPermission")
-                            fun startLocationUpdates() {
-                                val locationRequest = com.google.android.gms.location.LocationRequest.Builder(
-                                    com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY, 2000L
-                                ).build()
-
-                                val locationCallback = object : LocationCallback() {
-                                    override fun onLocationResult(result: LocationResult) {
-                                        result.lastLocation?.let { loc ->
-                                            myLocation = GeoPoint(loc.latitude, loc.longitude)
-                                        }
-                                    }
-                                }
-
-                                fused.requestLocationUpdates(locationRequest, locationCallback, mainLooper)
-                            }
-
+                // Permission launcher
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission()
+                ) { granted ->
+                    if (granted) {
+                        fused.lastLocation.addOnSuccessListener { loc ->
+                            loc?.let { myLocation = GeoPoint(it.latitude, it.longitude) }
                         }
                     }
+                }
 
-                // request or fetch location
-                LaunchedEffect(Unit) {
-                    when (ContextCompat.checkSelfPermission(
-                        this@MainActivity,
-                        Manifest.permission.ACCESS_FINE_LOCATION
-                    )) {
-                        PackageManager.PERMISSION_GRANTED -> {
+                rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                        if (granted) {
                             fused.lastLocation.addOnSuccessListener { loc ->
                                 loc?.let { myLocation = GeoPoint(it.latitude, it.longitude) }
                             }
                         }
+                    }
 
-                        else -> permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                // Request or fetch location
+                LaunchedEffect(Unit) {
+                    if (ContextCompat.checkSelfPermission(
+                            this@MainActivity,
+                            Manifest.permission.ACCESS_FINE_LOCATION
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        fused.lastLocation.addOnSuccessListener { loc ->
+                            loc?.let { myLocation = GeoPoint(it.latitude, it.longitude) }
+                        }
+                    } else {
+                        permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
                     }
                 }
 
@@ -108,67 +102,59 @@ class MainActivity : ComponentActivity() {
                         FloatingActionButton(onClick = {
                             myLocation?.let { loc ->
                                 nearest = hospitals.minByOrNull {
-                                    distanceKm(
-                                        it.lat,
-                                        it.lon,
-                                        loc.latitude,
-                                        loc.longitude
-                                    )
+                                    distanceKm(it.lat, it.lon, loc.latitude, loc.longitude)
                                 }
                             }
                         }) {
                             Text("Nearest")
                         }
                     }
-                ) { innerPadding ->
+                ) { inner ->
                     Column(
                         Modifier
                             .fillMaxSize()
-                            .padding(innerPadding)
+                            .padding(inner)
                     ) {
                         val mapView = remember { MapView(context) }
 
-                        // Map UI
+                        // Map View
                         Box(Modifier.weight(1f)) {
                             AndroidView(
                                 factory = {
                                     mapView.setTileSource(TileSourceFactory.MAPNIK)
                                     mapView.setMultiTouchControls(true)
-                                    mapView.controller.setZoom(13.0)
-                                    myLocation?.let {
-                                        mapView.controller.setCenter(it)
-                                    }
+                                    mapView.controller.setZoom(12.5)
+                                    myLocation?.let { mapView.controller.setCenter(it) }
                                     mapView
                                 },
                                 update = { map ->
                                     map.overlays.clear()
 
-                                    // Ambulance marker
+                                    // 🚑 Ambulance marker
                                     myLocation?.let { loc ->
                                         val marker = Marker(map)
                                         marker.position = loc
-                                        marker.title = "Ambulance"
+                                        marker.title = "Ambulance (You)"
                                         map.overlays.add(marker)
+                                        map.controller.setCenter(loc)
                                     }
 
                                     // Hospital markers
                                     hospitals.forEach { h ->
-                                        val marker = Marker(map)
-                                        marker.position = GeoPoint(h.lat, h.lon)
-                                        marker.title = h.name
-                                        map.overlays.add(marker)
+                                        val m = Marker(map)
+                                        m.position = GeoPoint(h.lat, h.lon)
+                                        m.title = "${h.name}\n)"
+                                        map.overlays.add(m)
                                     }
 
-                                    // Route polyline
+                                    // Real route via OpenRouteService
                                     if (nearest != null && myLocation != null) {
-                                        val route = Polyline()
-                                        route.setPoints(
-                                            listOf(
-                                                myLocation!!,
-                                                GeoPoint(nearest!!.lat, nearest!!.lon)
-                                            )
+                                        drawRealRoute(
+                                            myLocation!!,
+                                            GeoPoint(nearest!!.lat, nearest!!.lon),
+                                            map,
+                                            "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImIzNDM1ZWYyYTEzNTQ5ZmQ5M2VkMGE2YjYzZGY3NjVkIiwiaCI6Im11cm11cjY0In0=" // <--- Replace with your ORS key
                                         )
-                                        map.overlays.add(route)
                                     }
 
                                     map.invalidate()
@@ -177,10 +163,7 @@ class MainActivity : ComponentActivity() {
                             )
 
                             if (myLocation == null) {
-                                Box(
-                                    Modifier.fillMaxSize(),
-                                    contentAlignment = Alignment.Center
-                                ) {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                     Text("Fetching location…")
                                 }
                             }
@@ -189,15 +172,15 @@ class MainActivity : ComponentActivity() {
                         Divider()
 
                         Text(
-                            "Nearby Hospitals",
+                            "Nearby Hospitals (Delhi)",
                             style = MaterialTheme.typography.titleMedium,
                             modifier = Modifier.padding(8.dp)
                         )
 
                         LazyColumn(Modifier.height(180.dp)) {
-                            items(hospitals) { hospital ->
+                            items(hospitals) { h ->
                                 Card(
-                                    onClick = { nearest = hospital },
+                                    onClick = { nearest = h },
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(horizontal = 8.dp, vertical = 4.dp)
@@ -206,7 +189,7 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.padding(12.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text(hospital.name)
+                                        Text(h.name)
                                     }
                                 }
                             }
@@ -224,6 +207,78 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    //Load hospital data from CSV
+    private fun loadHospitalsFromCsv(context: android.content.Context): List<Hospital> {
+        val list = mutableListOf<Hospital>()
+        try {
+            val input = context.assets.open("Delhi_Hospitals_Data.csv")
+            val reader = CSVReader(InputStreamReader(input))
+            val lines = reader.readAll().drop(1) // skip header
+
+            for (line in lines) {
+                if (line.size >= 3) {
+                    val name = line[0]
+                    val lat = line[1].toDoubleOrNull() ?: continue
+                    val lon = line[2].toDoubleOrNull() ?: continue
+
+                    list.add(Hospital(name, lat, lon))
+                }
+            }
+            reader.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return list
+    }
+
+
+    // Draw realistic route using OpenRouteService API
+    private fun drawRealRoute(
+        start: GeoPoint,
+        end: GeoPoint,
+        mapView: MapView,
+        apiKey: String
+    ) {
+        val url =
+            "https://api.openrouteservice.org/v2/directions/driving-car?api_key=$apiKey&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}"
+
+        val client = OkHttpClient()
+        val request = Request.Builder().url(url).build()
+
+        Thread {
+            try {
+                val response = client.newCall(request).execute()
+                val json = response.body?.string()
+                if (json != null) {
+                    val jsonObj = JSONObject(json)
+                    val coords = jsonObj
+                        .getJSONArray("features")
+                        .getJSONObject(0)
+                        .getJSONObject("geometry")
+                        .getJSONArray("coordinates")
+
+                    val routePoints = mutableListOf<GeoPoint>()
+                    for (i in 0 until coords.length()) {
+                        val coord = coords.getJSONArray(i)
+                        val lon = coord.getDouble(0)
+                        val lat = coord.getDouble(1)
+                        routePoints.add(GeoPoint(lat, lon))
+                    }
+
+                    runOnUiThread {
+                        val line = Polyline()
+                        line.setPoints(routePoints)
+                        line.outlinePaint.strokeWidth = 8f
+                        mapView.overlays.add(line)
+                        mapView.invalidate()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }.start()
     }
 
     private fun distanceKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
